@@ -1,5 +1,7 @@
 package pdc;
 
+import java.io.*;
+
 /**
  * Message represents the communication unit in the CSM218 protocol.
  * 
@@ -9,30 +11,86 @@ package pdc;
  * blocks.
  */
 public class Message {
-    public String magic;
-    public int version;
-    public String type;
-    public String sender;
-    public long timestamp;
-    public byte[] payload;
+    
+    public String magic = "CSM218"; 
+    public int version = 1;
+    public String messageType;
+    public String studentId;
+    public long timestamp = System.currentTimeMillis();
+    public String payload = "";
 
-    public Message() {
+    public Message(String type, String student, String data) {
+        messageType = type;
+        studentId = student;
+        payload = data;
     }
 
-    /**
-     * Converts the message to a byte stream for network transmission.
-     * Students must implement their own framing (e.g., length-prefixing).
-     */
     public byte[] pack() {
-        // TODO: Implement custom binary or tag-based framing
-        throw new UnsupportedOperationException("You must design your own wire protocol.");
+        try {
+          
+            ByteArrayOutputStream messageStream = new ByteArrayOutputStream();
+            DataOutputStream dataWriter = new DataOutputStream(messageStream);      
+            dataWriter.writeUTF(magic);
+            dataWriter.writeInt(version);
+            dataWriter.writeUTF(messageType);
+            dataWriter.writeUTF(studentId);
+            dataWriter.writeLong(timestamp);
+            dataWriter.writeUTF(payload);  
+            byte[] messageBytes = messageStream.toByteArray();
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            DataOutputStream outputWriter = new DataOutputStream(outputStream);
+            outputWriter.writeInt(messageBytes.length);
+            outputWriter.write(messageBytes);          
+            return outputStream.toByteArray();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to pack message", e);
+        }
     }
 
-    /**
-     * Reconstructs a Message from a byte stream.
-     */
-    public static Message unpack(byte[] data) {
-        // TODO: Implement custom parsing logic
-        return null;
+  
+    public static Message unpack(byte[] data) throws Exception {
+
+        DataInputStream dataReader = new DataInputStream(new ByteArrayInputStream(data));
+        int messageLength = dataReader.readInt();
+        byte[] messageBytes = new byte[messageLength];
+        dataReader.readFully(messageBytes);
+        DataInputStream messageReader = new DataInputStream(new ByteArrayInputStream(messageBytes));
+        Message message = new Message("", "", "");
+        message.magic = messageReader.readUTF();
+        message.version = messageReader.readInt();
+        message.messageType = messageReader.readUTF();
+        message.studentId = messageReader.readUTF();
+        message.timestamp = messageReader.readLong();
+        message.payload = messageReader.readUTF();
+        
+        return message;
+    }
+
+  
+    public void writeTo(OutputStream outputStream) throws Exception {
+        outputStream.write(pack());
+        outputStream.flush();
+    }
+
+ 
+    public static Message readFrom(InputStream inputStream) throws Exception {
+        DataInputStream dataReader = new DataInputStream(inputStream);
+        
+    
+        int messageLength = dataReader.readInt();
+        byte[] messageBytes = new byte[messageLength];
+        dataReader.readFully(messageBytes);
+        
+   
+        DataInputStream messageReader = new DataInputStream(new ByteArrayInputStream(messageBytes));
+        Message message = new Message("", "", "");
+        message.magic = messageReader.readUTF();
+        message.version = messageReader.readInt();
+        message.messageType = messageReader.readUTF();
+        message.studentId = messageReader.readUTF();
+        message.timestamp = messageReader.readLong();
+        message.payload = messageReader.readUTF();
+        
+        return message;
     }
 }
