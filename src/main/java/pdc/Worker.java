@@ -1,152 +1,220 @@
 package pdc;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.io.*;
 import java.net.Socket;
+import java.util.Random;
 import java.util.concurrent.*;
 
-/**
- * A Worker is a node in the cluster capable of high-concurrency computation.
- * 
- * CHALLENGE: Efficiency is key. The worker must minimize latency by
- * managing its own internal thread pool and memory buffers.
- */
 public class Worker {
-    String id;
-    String studentId;
-    
-    Socket socket;
-    
-    ExecutorService executor = Executors.newFixedThreadPool(4);
-    volatile boolean running = true;
-    
-    public Worker() {
-       
-        this.id = System.getenv("WORKER_ID") != null ? 
-            System.getenv("WORKER_ID") : "worker01";
-        this.studentId = System.getenv("STUDENT_ID") != null ? 
-            System.getenv("STUDENT_ID") : "student01";
-    }
+    private Socket masterSocket;
+    private InputStream in;
+    private OutputStream out;
+    private String workerId;
 
-    public void joinCluster(String host, int port) throws Exception {
+    private final ExecutorService taskExecutor = Executors.newFixedThreadPool(4);
+    private final ScheduledExecutorService heartbeatSender = Executors.newSingleThreadScheduledExecutor();
+
+    private volatile boolean running = true;
+    private final Random random = new Random();
+
+    private int[][] matrixA;
+    private int[][] matrixB;
+    
+    
+    private static final String STUDENT_ID = System.getenv("STUDENT_ID") != null ? System.getenv("STUDENT_ID") : "default-student";
+    private static final String MASTER_HOST = System.getenv("MASTER_HOST") != null ? System.getenv("MASTER_HOST") : "localhost";
+    private static final int MASTER_PORT = System.getenv("PORT") != null ? Integer.parseInt(System.getenv("PORT")) : 8080;
+
+
+    public void joinCluster(String masterHost, int port) {
         try {
-           
-            socket = new Socket(host, port);
+            masterSocket = new Socket(masterHost, port);
+            in  = masterSocket.getInputStream();
+            out = masterSocket.getOutputStream();
 
-            new Message("CONNECT", studentId, id).writeTo(socket.getOutputStream());
-            new Message("REGISTER_WORKER", studentId, id).writeTo(socket.getOutputStream());   
-            Message.readFrom(socket.getInputStream());
-            new Message("REGISTER_CAPABILITIES", studentId, "MATRIX").writeTo(socket.getOutputStream());
-            System.out.println("Worker " + id + " is  connected to master");
-        } catch (Exception e) {
-            System.err.println("Failed to connect: " + e.getMessage());
+            workerId = "worker-" + System.currentTimeMillis() + "-" + random.nextInt(1000);
+
+        
+            Message regMsg = new Message(Message.TYPE_REGISTER, workerId, -1, new byte[0]);
+            sendMessage(regMsg);
+            System.out.println("Sent registration to master as " + workerId);
+
+        
+            Message ack = Message.readFromStream(in);
+            if (ack != null && ack.getType() == Message.TYPE_ACK) {
+                System.out.println("Received acknowledgment from master");
+            }
+
+          
+            heartbeatSender.scheduleAtFixedRate(this::sendHeartbeat, 1, 2, TimeUnit.SECONDS);
+
+          
+            Thread taskThread = new Thread(() -> {
+                try {
+                    processTasks();
+                } catch (IOException e) {
+                    if (running) {
+                        System.err.println("Task processing error: " + e.getMessage());
+                    }
+                }
+            });
+            taskThread.setDaemon(true);
+            taskThread.setName("worker-task-loop-" + workerId);
+            taskThread.start();
+
+        } catch (IOException e) {
+            System.err.println("Failed to connect to master: " + e.getMessage());
         }
     }
 
-  
+ 
+    private void processTasks() throws IOException {
+        while (running) {
+            Message message = Message.readFromStream(in);
+            if (message == null) {
+                System.out.println("Master closed connection");
+                break;
+            }
+
+            if (message.getType() == Message.TYPE_TASK) {
+            
+                taskExecutor.submit(() -> executeTask(message));
+            }
+        }
+    }
+
+
     public void execute() {
+        System.out.println("Execute called externally (tasks run via stream in background)");
+    }
+
+
+
+    private void executeTask(Message taskMsg) {
         try {
-            while (running) {
-                Message message = Message.readFrom(socket.getInputStream());
-                
-                if (message.messageType.equals("RPC_REQUEST")) {
-                    executor.submit(() -> handleTask(message));
-                    
-                } else if (message.messageType.equals("HEARTBEAT")) {
-                 
-                    executor.submit(() -> {
-                        try {
-                            new Message("HEARTBEAT_ACK", studentId, id).writeTo(socket.getOutputStream());
-                        } catch (Exception e) {}
-                    });
-                    
-                } else if (message.messageType.equals("SHUTDOWN")) {
-                    running = false;
+            System.out.println("Worker " + workerId + " executing task " + taskMsg.getTaskId());
+
+            ByteBuffer coordBuffer = ByteBuffer.wrap(taskMsg.getPayload());
+            coordBuffer.order(ByteOrder.BIG_ENDIAN);
+            int startRow = coordBuffer.getInt();
+            int endRow   = coordBuffer.getInt();
+            int startCol = coordBuffer.getInt();
+            int endCol   = coordBuffer.getInt();
+
+            if (matrixA == null) {
+                initializeDummyMatrices(100);
+            }
+
+            int blockRows = endRow - startRow;
+            int blockCols = endCol - startCol;
+            int[][] resultBlock = new int[blockRows][blockCols];
+
+    
+            for (int i = 0; i < blockRows; i++) {
+                for (int j = 0; j < blockCols; j++) {
+                    int sum = 0;
+                    for (int k = 0; k < matrixA[0].length; k++) {
+                        sum += matrixA[startRow + i][k] * matrixB[k][startCol + j];
+                    }
+                    resultBlock[i][j] = sum;
                 }
             }
-        } catch (Exception e) {
-          
-        }
-    }
 
-  
-    void handleTask(Message message) {
-        try {
-         
-            String[] payloadParts = message.payload.split("\\|");
-            String taskId = payloadParts[0];
-            String taskData = payloadParts[1];
-            String result = doWork(taskData);
-            synchronized(socket) {
-                new Message("TASK_COMPLETE", studentId, taskId + "|" + result)
-                    .writeTo(socket.getOutputStream());
-            }
-        } catch (Exception e) {
-          
-        }
-    }
-
- 
-    String doWork(String taskData) {
-        String[] dataParts = taskData.split(":");
-        String[] rangeInfo = dataParts[0].split(",");
-        int startRow = Integer.parseInt(rangeInfo[0]);
-        int endRow = Integer.parseInt(rangeInfo[1]);
-        int matrix1Cols = Integer.parseInt(rangeInfo[2]);
-        int matrix2Cols = Integer.parseInt(rangeInfo[3]);
-        
-        int[][] matrix1 = toMatrix(dataParts[1]);
-        int[][] matrix2 = toMatrix(dataParts[2]);
-        int[][] resultMatrix = new int[endRow - startRow][matrix2Cols];
-        
-
-        for (int row = startRow; row < endRow; row++) {
-            for (int col = 0; col < matrix2Cols; col++) {
-                for (int k = 0; k < matrix1Cols; k++) {
-                    resultMatrix[row - startRow][col] += matrix1[row][k] * matrix2[k][col];
-                }
-            }
-        }
-        
-        return startRow + "," + endRow + ":" + toString(resultMatrix);
-    }
-
-   
-    int[][] toMatrix(String matrixString) {
-        String[] numbers = matrixString.split(",");
-        int rows = Integer.parseInt(numbers[0]);
-        int cols = Integer.parseInt(numbers[1]);
-        int[][] matrix = new int[rows][cols];
-        int index = 2;
-        for (int row = 0; row < rows; row++) {
-            for (int col = 0; col < cols; col++) {
-                matrix[row][col] = Integer.parseInt(numbers[index++]);
-            }
-        }
-        return matrix;
-    }
-
- 
-    String toString(int[][] matrix) {
-        String result = matrix.length + "," + matrix[0].length;
-        for (int row = 0; row < matrix.length; row++) {
-            for (int col = 0; col < matrix[0].length; col++) {
-                result += "," + matrix[row][col];
-            }
-        }
-        return result;
-    }
-
-    public static void main(String[] args) throws Exception {
        
-        String host = System.getenv("MASTER_HOST") != null ? 
-            System.getenv("MASTER_HOST") : "localhost";
-        String port = System.getenv("MASTER_PORT") != null ? 
-            System.getenv("MASTER_PORT") : "1111";
+            ByteBuffer resultBuffer = ByteBuffer.allocate(16 + blockRows * blockCols * 4);
+            resultBuffer.order(ByteOrder.BIG_ENDIAN);
+            resultBuffer.putInt(startRow);
+            resultBuffer.putInt(endRow);
+            resultBuffer.putInt(startCol);
+            resultBuffer.putInt(endCol);
+
+            for (int i = 0; i < blockRows; i++) {
+                for (int j = 0; j < blockCols; j++) {
+                    resultBuffer.putInt(resultBlock[i][j]);
+                }
+            }
+
+            Message resultMsg = new Message(
+                    Message.TYPE_RESULT, workerId, taskMsg.getTaskId(), resultBuffer.array());
         
-        if (args.length > 0) host = args[0];
-        if (args.length > 1) port = args[1];
-        
-        Worker w = new Worker();
-        w.joinCluster(host, Integer.parseInt(port));
-        w.execute();
+            sendRPCResponse(resultMsg);
+            System.out.println("Worker " + workerId + " completed task " + taskMsg.getTaskId());
+
+        } catch (Exception e) {
+            System.err.println("Error executing task: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+
+    private void initializeDummyMatrices(int size) {
+        matrixA = new int[size][size];
+        matrixB = new int[size][size];
+
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++) {
+                matrixA[i][j] = random.nextInt(10);
+                matrixB[i][j] = random.nextInt(10);
+            }
+        }
+    }
+
+    private void sendHeartbeat() {
+        if (!running) return;
+
+        try {
+            Message heartbeat = new Message(Message.TYPE_HEARTBEAT, workerId, -1, new byte[0]);
+            sendMessage(heartbeat);
+        } catch (IOException e) {
+            System.err.println("Failed to send heartbeat: " + e.getMessage());
+            running = false;
+        }
+    }
+
+    private synchronized void sendMessage(Message msg) throws IOException {
+        byte[] data = msg.pack();
+        out.write(data);
+        out.flush();
+    }
+
+
+    private synchronized void sendRPCResponse(Message response) throws IOException {
+        sendMessage(response);
+    }
+
+ 
+    public void shutdown() {
+        running = false;
+        heartbeatSender.shutdownNow();
+        taskExecutor.shutdownNow();
+
+        try {
+            if (masterSocket != null) masterSocket.close();
+        } catch (IOException e) {
+         
+        }
+    }
+
+    public static void main(String[] args) {
+        if (args.length < 2) {
+            System.err.println("Usage: java pdc.Worker <master_host> <master_port>");
+            System.exit(1);
+        }
+
+        String masterHost = args[0];
+        int port = Integer.parseInt(args[1]);
+
+        Worker worker = new Worker();
+        Runtime.getRuntime().addShutdownHook(new Thread(worker::shutdown));
+        worker.joinCluster(masterHost, port);
+
+       
+        try {
+            Thread.currentThread().join();
+        } catch (InterruptedException e) {
+            worker.shutdown();
+        }
     }
 }
